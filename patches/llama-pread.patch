@@ -1,0 +1,188 @@
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 1234..5678 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -1482,6 +1482,20 @@ struct llama_file {
+ // mmap abstraction
+ //
+
++// Flash-MoE: Configuration for pread-based loading
++struct llama_pread_config {
++    bool use_pread = false;           // Enable pread() instead of mmap
++    bool use_gpu_staging = false;     // Enable GPU staging buffer
++    size_t staging_buffer_size = 0;   // Size of GPU staging buffer
++    int file_fd = -1;                 // File descriptor for pread
++};
++
++// Global config (set via environment or command line)
++static llama_pread_config g_pread_config;
++
++// Forward declaration for staging buffer
++struct llama_expert_staging;
++
+ struct llama_mmap {
+     void * addr;
+     size_t size;
+@@ -1492,6 +1506,11 @@ struct llama_mmap {
+     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+     ~llama_mmap();
+
++    // Flash-MoE: Alternative constructor for pread-based loading
++    static llama_mmap* create_pread_based(struct llama_file * file, llama_pread_config* config);
++
++    // Flash-MoE: Load data on-demand using pread
++    bool load_fragment_pread(size_t offset, size_t size, void* dst);
++
+     // partial unmapping
+     void unmap_fragment(size_t first, size_t last);
+
+@@ -3270,6 +3289,15 @@ struct llama_model_loader {
+     std::vector<std::unique_ptr<llama_mmap>> mappings;
+     std::vector<ggml_context_ptr> contexts;
+
++    // Flash-MoE: Pread-based loading support
++    llama_pread_config pread_cfg;
++    std::unique_ptr<llama_expert_staging> expert_staging;
++
++    // Flash-MoE: Expert metadata for on-demand loading
++    struct expert_info {
++        size_t file_idx;
++        size_t offset;
++        size_t size;
++    };
++    std::unordered_map<std::string, expert_info> expert_map;
++
+     llama_model_loader(const std::string & fname, bool use_pread_loading = false);
+
+     template<typename T>
+@@ -3300,6 +3328,10 @@ struct llama_model_loader {
+     void load_data_for(struct ggml_tensor * cur) const;
+
+     size_t size_by_index(uint32_t idx) const;
++
++
++    // Flash-MoE: Load expert on-demand using pread
++    bool load_expert_pread(const char* expert_name, void* dst_buffer);
+ };
+
+ // Implementation
+@@ -5470,6 +5502,45 @@ static bool llm_load_tensors(
+
+                 layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert});
+
++                // Flash-MoE: Store expert metadata for on-demand loading
++                if (g_pread_config.use_pread) {
++                    auto store_expert_info = [&](const char* name, struct ggml_tensor* tensor) {
++                        if (tensor) {
++                            const auto& w = ml.require_weight(name);
++                            ml.expert_map[name] = {
++                                w.idx,
++                                w.offs,
++                                ggml_nbytes(tensor)
++                            };
++                        }
++                    };
++                    store_expert_info(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i).c_str(), layer.ffn_gate_exps);
++                    store_expert_info(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i).c_str(), layer.ffn_down_exps);
++                    store_expert_info(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i).c_str(), layer.ffn_up_exps);
++
++                    // Don't load expert data yet - will be loaded on-demand
++                    // Set tensor data to nullptr; will be filled by staging buffer
++                    if (layer.ffn_gate_exps) layer.ffn_gate_exps->data = nullptr;
++                    if (layer.ffn_down_exps) layer.ffn_down_exps->data = nullptr;
++                    if (layer.ffn_up_exps)   layer.ffn_up_exps->data = nullptr;
++                }
++
+                 // optional Moe biases
+                 layer.ffn_gate_exps_bias = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff, n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                 layer.ffn_down_exps_bias = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {n_embd, n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+@@ -7075,6 +7146,50 @@ static struct ggml_tensor * llm_build_moe_ffn(
+     ggml_tensor * cur,
+     bool        flash_attn) {
+
++    // Flash-MoE: On-demand expert loading with GPU staging
++    if (g_pread_config.use_pread && g_pread_config.use_gpu_staging) {
++        // Get selected expert IDs from gating
++        // These are the K active experts for this token
++        const int n_expert_used = hparams.n_expert_used;  // K value (now 6)
++
++        // Pre-load active experts into staging buffer
++        // This happens before the actual matmul operations
++        for (int i = 0; i < n_expert_used; i++) {
++            int expert_id = selected_experts->data[i];  // Simplified
++
++            // Calculate file offset for this expert
++            // Experts are stored as [n_embd, n_ff, n_expert] tensor
++            size_t expert_size = layer.ffn_gate_exps->nb[2];  // Stride between experts
++            size_t file_offset = layer.ffn_gate_exps->meta.offset + expert_id * expert_size;
++
++            // Load via pread into staging buffer
++            void* gpu_ptr = ml.load_expert_into_staging(expert_id, file_offset, expert_size);
++
++            // Use staged expert for computation
++            // ... (integrate with ggml_mul_mat_id)
++        }
++
++        // Create view tensors pointing to staged GPU memory
++        // This allows ggml_mul_mat_id to use the staged experts
++        ggml_tensor* gate_exps_staged = ggml_view_3d(ctx,
++            layer.ffn_gate_exps,
++            n_embd, n_ff, n_expert_used,
++            layer.ffn_gate_exps->nb[1],
++            layer.ffn_gate_exps->nb[2],
++            0  // Offset into staging buffer
++        );
++
++        // Compute with staged experts
++        ggml_tensor * up = ggml_mul_mat_id(ctx, gate_exps_staged, cur, selected_experts);
++        // ... rest of MoE computation
++    }
++
++    // Original implementation (for non-pread path)
+     ggml_tensor * gate_exps = layer.ffn_gate_exps;
+     ggml_tensor * up_exps   = layer.ffn_up_exps;
+     ggml_tensor * down_exps = layer.ffn_down_exps;
+@@ -16000,6 +16115,25 @@ static std::string llama_model_default_params() {
+ }
+
+ //
++// Flash-MoE: Environment variable parsing
++//
++
++static void llama_parse_pread_env() {
++    const char* use_pread = getenv("LLAMA_USE_PREAD");
++    if (use_pread && (strcmp(use_pread, "1") == 0 || strcmp(use_pread, "true") == 0)) {
++        g_pread_config.use_pread = true;
++        LLAMA_LOG_INFO("%s: Flash-MoE pread() loading enabled\n", __func__);
++    }
++
++    const char* use_staging = getenv("LLAMA_USE_GPU_STAGING");
++    if (use_staging && (strcmp(use_staging, "1") == 0 || strcmp(use_staging, "true") == 0)) {
++        g_pread_config.use_gpu_staging = true;
++        LLAMA_LOG_INFO("%s: Flash-MoE GPU staging buffer enabled\n", __func__);
++    }
++
++    // staging_buffer_size can be set via LLAMA_STAGING_BUFFER_SIZE (in MB)
++    const char* staging_size = getenv("LLAMA_STAGING_BUFFER_SIZE");
++    if (staging_size) {
++        g_pread_config.staging_buffer_size = atoi(staging_size) * 1024 * 1024;
++    } else {
++        // Default: 6 experts * 24MB = 144MB
++        g_pread_config.staging_buffer_size = 6 * 24 * 1024 * 1024;
++    }
++}
++
++//
+ // model loading and unloading
+ //
+
+@@ -16250,6 +16384,9 @@ struct llama_model * llama_load_model_from_file(
+     try {
+         llama_model * model = new llama_model;
+
++        // Flash-MoE: Parse environment variables
++        llama_parse_pread_env();
++
+         llm_load_arch(ml, model->arch);
+         llm_load_hparams(ml, model->hparams);
+         llm_load_vocab(ml, model->vocab);
