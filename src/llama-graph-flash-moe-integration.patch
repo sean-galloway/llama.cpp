@@ -1,0 +1,118 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1234..5678 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -20,6 +20,7 @@
+ #include "llama-vocab.h"
+ #include "llama-adapter.h"
+ #include "llama-arch.h"
++#include "llama-staged-moe-complete.h"
+
+ #include <algorithm>
+ #include <cassert>
+@@ -1268,6 +1269,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * gate_up_exps_s,
+         ggml_tensor * down_exps_s) const {
+
++    // Flash-MoE: Staged loading integration
++    // When flash_moe is enabled and expert tensors are nullptr,
++    // we need to load the active experts on-demand
++    if (staged_moe_is_enabled()) {
++        // Note: At graph construction time, we don't know which experts will be selected.
++        // The selection depends on the input tokens and is computed at runtime.
++        //
++        // Approach 1: Add a hook before graph execution to:
++        //   1. Run the router (gate_inp) to get selected_experts
++        //   2. Load the K active experts into staging buffer
++        //   3. Update tensor pointers to point to staged buffer
++        //   4. Execute the graph
++        //
++        // Approach 2: Custom ggml operator that loads experts on first use
++        //   - More complex, requires backend modifications
++        //
++        // For now, we implement a simplified version of Approach 1:
++        // The actual expert loading happens in llama_decode() before graph execution
++
++        // Mark that this layer uses staged experts
++        // The actual loading will be done by staged_moe_prepare_experts() called from llama_decode()
++
++        // Log that we're using staged loading for this layer
++        static std::once_flag log_once;
++        std::call_once(log_once, [&]() {
++            LLAMA_LOG_INFO("Flash-MoE: Using staged loading for MoE layers\n");
++        });
++    }
++
++    // If flash_moe is enabled and expert tensor is nullptr, it means we deferred allocation.
++    // In this case, we need to use the staging buffer pointer instead.
++    // The staging buffer will be filled before graph execution.
++    if (staged_moe_is_enabled() && up_exps == nullptr) {
++        // Use a placeholder - the actual pointer will be set before execution
++        // This requires coordination with llama_decode()
++        LLAMA_LOG_WARN("Flash-MoE: Expert tensor is nullptr at graph construction - this is expected\n");
++    }
++
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -1595,6 +1634,58 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     return cur;
+ }
+
++// Flash-MoE: Helper function to load active experts before graph execution
++// This should be called from llama_decode() after computing the router logits
++// but before executing the graph
++bool staged_moe_prepare_experts(
++        const llama_model & model,
++        const llama_hparams & hparams,
++        int layer_id,
++        const int32_t * selected_experts,  // Array of K expert IDs
++        int n_expert_used) {
++
++    if (!staged_moe_is_enabled()) {
++        return true;
++    }
++
++    staged_moe_manager* manager = get_staged_moe_manager();
++    if (!manager) {
++        return false;
++    }
++
++    // Load gate, up, and down experts for the selected IDs
++    for (int i = 0; i < n_expert_used; i++) {
++        int expert_id = selected_experts[i];
++
++        // Load gate expert
++        void* gate_data = manager->get_expert_data(layer_id, "gate", expert_id);
++        if (!gate_data) {
++            LLAMA_LOG_ERROR("Flash-MoE: Failed to load gate expert %d for layer %d\n", expert_id, layer_id);
++            return false;
++        }
++
++        // Load up expert
++        void* up_data = manager->get_expert_data(layer_id, "up", expert_id);
++        if (!up_data) {
++            LLAMA_LOG_ERROR("Flash-MoE: Failed to load up expert %d for layer %d\n", expert_id, layer_id);
++            return false;
++        }
++
++        // Load down expert
++        void* down_data = manager->get_expert_data(layer_id, "down", expert_id);
++        if (!down_data) {
++            LLAMA_LOG_ERROR("Flash-MoE: Failed to load down expert %d for layer %d\n", expert_id, layer_id);
++            return false;
++        }
++    }
++
++    static int total_preparations = 0;
++    total_preparations++;
++    if (total_preparations % 100 == 0) {
++        LLAMA_LOG_INFO("Flash-MoE: Prepared experts %d times\n", total_preparations);
++    }
++
++    return true;
++}
++
+ static ggml_tensor * llm_build_moe_ffn(
+         const llm_graph_context        & gctx,
+         ggml_tensor * cur,

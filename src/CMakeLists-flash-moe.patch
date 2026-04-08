@@ -1,0 +1,13 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 1234..5678 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -45,6 +45,8 @@ set(LLAMA_SOURCES
+     llama-model-loader.cpp
+     llama-model.cpp
+     llama-vocab.cpp
++    llama-staged-moe-complete.cpp
++    llama-staged-moe-complete.h
+     unicode-data.cpp
+     unicode.cpp
+     ${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp

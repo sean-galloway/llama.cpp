@@ -1,0 +1,110 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1234..5678 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -45,6 +45,7 @@
+ #include "llama-vocab.h"
+ #include "llama-kv-cache.h"
+ #include "llama-model-loader.h"
++#include "llama-staged-moe-complete.h"
+
+ #include <algorithm>
+ #include <array>
+@@ -2620,6 +2621,12 @@ static void llm_load_tensors(
+
+     const bool use_mmap_buffer = true;
+
++    // Flash-MoE: Check if staged loading is enabled
++    const bool flash_moe_enabled = staged_moe_init_from_env();
++    if (flash_moe_enabled) {
++        LLAMA_LOG_INFO("%s: Flash-MoE staged loading enabled\n", __func__);
++    }
++
+     LLAMA_LOG_INFO("%s: using %sfor tensor loading\n", __func__, ml.use_mmap ? "mmap " : "");
+
+     // Calculate size of tensors in the model
+@@ -2802,10 +2809,36 @@ static void llm_load_tensors(
+                         }
+
+                         if (n_expert > 1) {
+-                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+-                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+-                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
++                            // Flash-MoE: Staged loading for MoE experts
++                            if (flash_moe_enabled) {
++                                // Store metadata but don't allocate tensors
++                                LLAMA_LOG_INFO("%s: Flash-MoE: deferring allocation for layer %d experts\n", __func__, i);
++
++                                // Get file offsets from model loader
++                                const auto& gate_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i));
++                                const auto& down_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i));
++                                const auto& up_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i));
++
++                                // Register all experts for this layer
++                                for (int e = 0; e < n_expert; e++) {
++                                    size_t expert_size_gate = (n_embd * n_ff) * ggml_type_size(gate_info.type);
++                                    size_t expert_size_down = (n_ff * n_embd) * ggml_type_size(down_info.type);
++                                    size_t expert_size_up = (n_embd * n_ff) * ggml_type_size(up_info.type);
++
++                                    get_staged_moe_manager()->register_expert(i, "gate", e, gate_info.file_idx, gate_info.offset + e * expert_size_gate, expert_size_gate);
++                                    get_staged_moe_manager()->register_expert(i, "down", e, down_info.file_idx, down_info.offset + e * expert_size_down, expert_size_down);
++                                    get_staged_moe_manager()->register_expert(i, "up", e, up_info.file_idx, up_info.offset + e * expert_size_up, expert_size_up);
++                                }
++
++                                // Set tensors to nullptr - will be loaded on-demand
++                                layer.ffn_gate_exps = nullptr;
++                                layer.ffn_down_exps = nullptr;
++                                layer.ffn_up_exps = nullptr;
++                            } else {
++                                // Original: allocate all experts
++                                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
++                                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
++                                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
++                            }
+                         }
+
+                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+@@ -2891,9 +2924,32 @@ static void llm_load_tensors(
+                     } else {
+                         const int64_t n_ff_exp = hparams.n_ff_exp;
+
+-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                        // Flash-MoE: Staged loading for DeepSeek/Kimi MoE
++                        if (flash_moe_enabled) {
++                            LLAMA_LOG_INFO("%s: Flash-MoE: deferring allocation for layer %d experts (DeepSeek/Kimi)\n", __func__, i);
++
++                            const auto& gate_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i));
++                            const auto& down_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i));
++                            const auto& up_info = ml.get_tensor_info(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i));
++
++                            for (int e = 0; e < n_expert; e++) {
++                                size_t expert_size_gate = (n_embd * n_ff_exp) * ggml_type_size(gate_info.type);
++                                size_t expert_size_down = (n_ff_exp * n_embd) * ggml_type_size(down_info.type);
++                                size_t expert_size_up = (n_embd * n_ff_exp) * ggml_type_size(up_info.type);
++
++                                get_staged_moe_manager()->register_expert(i, "gate", e, gate_info.file_idx, gate_info.offset + e * expert_size_gate, expert_size_gate);
++                                get_staged_moe_manager()->register_expert(i, "down", e, down_info.file_idx, down_info.offset + e * expert_size_down, expert_size_down);
++                                get_staged_moe_manager()->register_expert(i, "up", e, up_info.file_idx, up_info.offset + e * expert_size_up, expert_size_up);
++                            }
++
++                            layer.ffn_gate_exps = nullptr;
++                            layer.ffn_down_exps = nullptr;
++                            layer.ffn_up_exps = nullptr;
++                        } else {
++                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
++                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                        }
+
+                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                     }
+@@ -8939,6 +8995,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+     };
++    // Flash-MoE: Environment variables are checked in staged_moe_init_from_env()
+
+     return result;
+ }
