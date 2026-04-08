@@ -1,0 +1,111 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1234..5678 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -50,6 +50,7 @@
+ #include "llama-vocab.h"
+ #include "llama-kv-cache.h"
+ #include "llama-model-loader.h"
++#include "llama-staged-moe.h"
+
+ #include <algorithm>
+ #include <array>
+@@ -2740,9 +2741,31 @@ static void llm_load_tensors(
+         auto create_tensor_gate_up_exps = [&](llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+             layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+             if (layer.ffn_gate_up_exps == nullptr) {
+-                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+-                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
++                // Flash-MoE: Check if staged loading is enabled
++                if (hparams.flash_moe_staged) {
++                    // Don't allocate - store metadata for lazy loading
++                    const char* gate_name = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid).c_str();
++                    const char* up_name = tn(LLM_TENSOR_FFN_UP_EXPS, "weight", bid).c_str();
++
++                    // Create tensor metadata only (no allocation)
++                    layer.ffn_gate_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_, n_ff_, 0); // 0 experts allocated
++                    layer.ffn_up_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_, n_ff_, 0);
++
++                    // Store file offsets for all experts
++                    for (int e = 0; e < n_expert_; e++) {
++                        expert_metadata meta;
++                        meta.file_idx = 0; // TODO: get from loader
++                        meta.offset = 0;   // TODO: calculate
++                        meta.size = n_embd_ * n_ff_ * sizeof(float);
++                        meta.is_loaded = false;
++                        // Add to staged_moe_manager
++                    }
++                } else {
++                    // Original behavior: allocate all experts
++                    layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
++                    layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
++                }
+             }
+         };
+
+@@ -2802,9 +2825,31 @@ static void llm_load_tensors(
+                         }
+
+                         if (n_expert > 1) {
+-                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+-                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+-                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
++                            // Flash-MoE: Staged loading for MoE experts
++                            if (hparams.flash_moe_staged) {
++                                // Store metadata but don't allocate
++                                for (int e = 0; e < n_expert; e++) {
++                                    char key[64];
++                                    snprintf(key, sizeof(key), "layer_%d_expert_%d", i, e);
++
++                                    expert_metadata meta;
++                                    meta.file_idx = 0;
++                                    meta.offset = 0; // Calculate from tensor position
++                                    meta.size = (n_embd * n_ff) * sizeof(float);
++                                    meta.is_loaded = false;
++
++                                    // TODO: Add to staged_moe_manager
++                                }
++
++                                // Create placeholder tensors (will be filled on-demand)
++                                layer.ffn_gate_exps = nullptr; // Mark as staged
++                                layer.ffn_down_exps = nullptr;
++                                layer.ffn_up_exps = nullptr;
++                            } else {
++                                // Original: allocate all experts
++                                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
++                                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
++                                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
++                            }
+                         }
+
+                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+@@ -2891,9 +2936,28 @@ static void llm_load_tensors(
+                     } else {
+                         const int64_t n_ff_exp = hparams.n_ff_exp;
+
+-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                        // Flash-MoE: Staged loading
++                        if (hparams.flash_moe_staged) {
++                            for (int e = 0; e < n_expert; e++) {
++                                expert_metadata meta;
++                                meta.file_idx = 0;
++                                meta.offset = 0;
++                                meta.size = (n_embd * n_ff_exp) * sizeof(float);
++                                meta.is_loaded = false;
++                                // TODO: Add to manager
++                            }
++
++                            // Placeholder tensors
++                            layer.ffn_gate_exps = nullptr;
++                            layer.ffn_down_exps = nullptr;
++                            layer.ffn_up_exps = nullptr;
++                        } else {
++                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
++                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
++                        }
+
+                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                     }
