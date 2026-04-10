@@ -10,10 +10,12 @@
 #include <vector>
 #include <unordered_map>
 #include <string>
+#include <mutex>
 
 // Forward declarations
 struct llama_model;
 struct llama_model_loader;
+struct llama_hparams;
 
 namespace llama {
 
@@ -46,6 +48,7 @@ struct staged_expert_buffer {
     size_t expert_size = 0;
     uint64_t access_counter = 0;
     ggml_backend* backend = nullptr;
+    mutable std::mutex mutex;  // Thread-safety for concurrent access
 
     // Initialize with K slots
     bool init(size_t k_experts, size_t expert_bytes, ggml_backend* cuda_backend);
@@ -70,13 +73,33 @@ struct staged_moe_manager {
     // Initialize from model loader
     bool init(const llama_model_loader& loader, const staged_moe_config& cfg);
 
+    // Initialize from hparams and open file
+    bool init(const llama_hparams& hparams, int file_fd, ggml_backend* cuda_backend);
+
     // Get expert tensor data
     // Returns pointer to staged buffer (GPU if offloaded, CPU otherwise)
     void* get_expert_data(int layer, const char* type, int expert_id);
 
+    // Register expert metadata (called during model loading)
+    void register_expert(int layer, const char* type, int expert_id,
+                         uint32_t file_idx, size_t offset, size_t size);
+
     // Shutdown
     void free();
 };
+
+// Initialize from environment variables
+// Call this early in llama_init
+bool staged_moe_init_from_env();
+
+// Check if staged loading is enabled
+bool staged_moe_is_enabled();
+
+// Get the global staged MoE manager
+staged_moe_manager* get_staged_moe_manager();
+
+// Hook for build_moe_ffn - get expert pointer for computation
+void* staged_moe_get_expert_for_compute(int layer, const char* type, int expert_id);
 
 // Check if tensor name is an MoE expert tensor
 bool is_moe_expert_tensor(const char* name);

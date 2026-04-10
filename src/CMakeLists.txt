@@ -149,6 +149,12 @@ add_library(llama
             models/t5-enc.cpp
             models/wavtokenizer-dec.cpp
             models/xverse.cpp
+            llama-staged-moe.cpp
+            llama-staged-moe.h
+            flash_moe_cuda.cpp
+            flash_moe_cuda.h
+            flash_moe_custom_op.h
+            flash_moe_custom_op_cuda.h
             )
 
 set_target_properties(llama PROPERTIES
@@ -162,6 +168,17 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# Flash-MoE CUDA support
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(llama PRIVATE
+        CUDA::cudart
+        CUDA::cublas
+    )
+    target_compile_definitions(llama PRIVATE FLASH_MOE_CUDA_ENABLED)
+    message(STATUS "Flash-MoE CUDA: Enabled")
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

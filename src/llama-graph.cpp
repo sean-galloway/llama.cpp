@@ -1,5 +1,10 @@
 #include "llama-graph.h"
 
+// Flash-MoE CUDA support
+#ifdef FLASH_MOE_CUDA_ENABLED
+#include "flash_moe_custom_op_cuda.h"
+#endif
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1292,6 +1297,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // Flash-MoE: Check if staged loading is enabled and we should use custom op
+    #ifdef FLASH_MOE_CUDA_ENABLED
+    if (staged_moe_is_enabled() && gate_inp != nullptr) {
+        // Use Flash-MoE custom op for GPU-accelerated MoE computation
+        // This path uses pread() + GPU staging buffer to avoid MMU faults
+        static thread_local flash_moe_userdata fm_userdata;
+        fm_userdata.mgr = get_staged_moe_manager();
+        fm_userdata.layer_id = il;
+        fm_userdata.n_expert = n_expert;
+        fm_userdata.n_expert_used = n_expert_used;
+        fm_userdata.n_embd = n_embd;
+        // Use n_ff from hparams if available, otherwise estimate from gate_exps dims
+        fm_userdata.n_ff = hparams.n_ff_exp > 0 ? hparams.n_ff_exp : (gate_exps ? gate_exps->ne[0] : n_embd);
+        fm_userdata.gating_op = gating_op;
+
+        if (fm_userdata.mgr != nullptr) {
+            ggml_tensor * flash_moe_out = ggml_custom_4d(
+                ctx0,
+                cur,           // src0: input tensor [n_embd, n_tokens]
+                gate_inp,      // src1: gate weights [n_expert, n_embd]
+                nullptr,       // src2: not used
+                nullptr,       // src3: not used
+                n_embd,        // ne0
+                n_tokens,      // ne1
+                1,             // ne2
+                1,             // ne3
+                flash_moe_custom_op_cuda,
+                &fm_userdata,
+                sizeof(flash_moe_userdata));
+
+            if (flash_moe_out != nullptr) {
+                cb(flash_moe_out, "ffn_moe_flash_moe_cuda", il);
+                return flash_moe_out;
+            }
+        }
+    }
+    #endif
 
     ggml_tensor * logits = nullptr;
 
