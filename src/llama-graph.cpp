@@ -1300,11 +1300,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Flash-MoE: Check if staged loading is enabled and we should use custom op
     #ifdef FLASH_MOE_CUDA_ENABLED
-    if (staged_moe_is_enabled() && gate_inp != nullptr) {
+    if (llama::staged_moe_is_enabled() && gate_inp != nullptr) {
         // Use Flash-MoE custom op for GPU-accelerated MoE computation
         // This path uses pread() + GPU staging buffer to avoid MMU faults
-        static thread_local flash_moe_userdata fm_userdata;
-        fm_userdata.mgr = get_staged_moe_manager();
+        static thread_local llama::flash_moe_userdata fm_userdata;
+        fm_userdata.mgr = llama::get_staged_moe_manager();
         fm_userdata.layer_id = il;
         fm_userdata.n_expert = n_expert;
         fm_userdata.n_expert_used = n_expert_used;
@@ -1324,9 +1324,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 n_tokens,      // ne1
                 1,             // ne2
                 1,             // ne3
-                flash_moe_custom_op_cuda,
+                llama::flash_moe_custom_op_cuda,
                 &fm_userdata,
-                sizeof(flash_moe_userdata));
+                sizeof(llama::flash_moe_userdata));
 
             if (flash_moe_out != nullptr) {
                 cb(flash_moe_out, "ffn_moe_flash_moe_cuda", il);
