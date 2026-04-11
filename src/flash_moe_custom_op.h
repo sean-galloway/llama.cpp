@@ -6,14 +6,13 @@
 
 #include "ggml.h"
 #include "llama-staged-moe.h"
+#include "llama-hparams.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 namespace llama {
-
-// Forward declarations from llama-model
-enum llama_expert_gating_func_type;
 
 // User data passed to custom operator
 struct flash_moe_userdata {
