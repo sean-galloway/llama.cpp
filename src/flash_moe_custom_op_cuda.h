@@ -61,12 +61,12 @@ inline void flash_moe_custom_op_cuda(
             if (!cuda_ctx->init(0, n_embd, n_ff)) {
                 fprintf(stderr, "Flash-MoE CUDA: Initialization failed, falling back to CPU\n");
                 // Fall back to CPU implementation
-                flash_moe_custom_op(dst, src0, src1, ith, nth, userdata);
+                flash_moe_custom_op(dst, ith, nth, userdata);
                 return;
             }
         } else {
             fprintf(stderr, "Flash-MoE CUDA: CUDA not available, using CPU\n");
-            flash_moe_custom_op(dst, src0, src1, ith, nth, userdata);
+            flash_moe_custom_op(dst, ith, nth, userdata);
             return;
         }
     }
