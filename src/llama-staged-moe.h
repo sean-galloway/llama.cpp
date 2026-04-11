@@ -5,6 +5,7 @@
 #define LLAMA_STAGED_MOE_H
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
