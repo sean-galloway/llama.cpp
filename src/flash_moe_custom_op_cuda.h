@@ -14,8 +14,6 @@ namespace llama {
 // This version uses GPU staging buffer to avoid MMU faults
 inline void flash_moe_custom_op_cuda(
     struct ggml_tensor* dst,
-    const struct ggml_tensor* src0,
-    const struct ggml_tensor* src1,
     int ith, int nth,
     void* userdata) {
 
@@ -25,6 +23,15 @@ inline void flash_moe_custom_op_cuda(
     flash_moe_userdata* data = (flash_moe_userdata*)userdata;
     if (!data || !data->mgr) {
         fprintf(stderr, "Flash-MoE CUDA: Invalid userdata\n");
+        return;
+    }
+
+    // Get source tensors from dst->src[]
+    struct ggml_tensor* src0 = dst->src[0];  // cur input
+    struct ggml_tensor* src1 = dst->src[1];  // gate weights
+
+    if (!src0 || !src1) {
+        fprintf(stderr, "Flash-MoE CUDA: Missing source tensors\n");
         return;
     }
 

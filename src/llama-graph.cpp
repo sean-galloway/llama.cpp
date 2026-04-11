@@ -1314,19 +1314,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         fm_userdata.gating_op = gating_op;
 
         if (fm_userdata.mgr != nullptr) {
+            // Prepare source tensors array
+            struct ggml_tensor * args[] = { cur, gate_inp };
+
             ggml_tensor * flash_moe_out = ggml_custom_4d(
                 ctx0,
-                cur,           // src0: input tensor [n_embd, n_tokens]
-                gate_inp,      // src1: gate weights [n_expert, n_embd]
-                nullptr,       // src2: not used
-                nullptr,       // src3: not used
-                n_embd,        // ne0
-                n_tokens,      // ne1
-                1,             // ne2
-                1,             // ne3
+                GGML_TYPE_F32,           // output type
+                n_embd,                  // ne0
+                n_tokens,                // ne1
+                1,                       // ne2
+                1,                       // ne3
+                args,                    // src tensors
+                2,                       // n_args
                 llama::flash_moe_custom_op_cuda,
-                &fm_userdata,
-                sizeof(llama::flash_moe_userdata));
+                1,                       // n_tasks
+                &fm_userdata);
 
             if (flash_moe_out != nullptr) {
                 cb(flash_moe_out, "ffn_moe_flash_moe_cuda", il);
